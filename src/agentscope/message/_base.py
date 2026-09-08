@@ -74,7 +74,9 @@ def _merge_tool_result_data_blocks(
             target, chunks = group
             chunks.append(item.source.data)
             target.name = item.name or target.name
-            target.source.media_type = item.source.media_type
+            target.source.media_type = (
+                item.source.media_type or target.source.media_type
+            )
 
     for target, chunks in groups.values():
         target.source.data = _merge_base64_chunk_group(chunks)

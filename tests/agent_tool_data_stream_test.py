@@ -163,6 +163,42 @@ class ToolDataStreamTest(IsolatedAsyncioTestCase):
         self.assertEqual(len(output), 1)
         self.assertEqual(output[0].source.data, "aGI=")
 
+    async def test_empty_media_type_keeps_previous_value(self) -> None:
+        """An empty later media type follows Toolkit merge semantics."""
+        reply = AssistantMsg(id="reply-1", name="agent", content=[])
+        reply.append_event(
+            ToolResultStartEvent(
+                reply_id="reply-1",
+                tool_call_id="tool-1",
+                tool_call_name="stream_data",
+            ),
+        )
+        for payload, media_type in ((b"a", "audio/wav"), (b"b", "")):
+            reply.append_event(
+                ToolResultDataDeltaEvent(
+                    reply_id="reply-1",
+                    tool_call_id="tool-1",
+                    block_id="data-1",
+                    data=base64.b64encode(payload).decode("ascii"),
+                    media_type=media_type,
+                ),
+            )
+        reply.append_event(
+            ToolResultEndEvent(
+                reply_id="reply-1",
+                tool_call_id="tool-1",
+                state=ToolResultState.SUCCESS,
+            ),
+        )
+
+        result = list(reply.get_content_blocks("tool_result"))[0]
+        self.assertEqual(len(result.output), 1)
+        self.assertEqual(result.output[0].source.media_type, "audio/wav")
+        self.assertEqual(
+            base64.b64decode(result.output[0].source.data),
+            b"ab",
+        )
+
     async def test_merging_data_chunks_preserves_block_order(self) -> None:
         """Removing repeated data chunks also normalizes adjacent text."""
         reply = AssistantMsg(id="reply-1", name="agent", content=[])

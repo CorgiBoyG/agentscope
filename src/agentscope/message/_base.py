@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """The message class in agentscope."""
 import base64
+import binascii
 from datetime import datetime
 from typing import Literal, List, overload, Sequence, Self, TYPE_CHECKING, Any
 
@@ -28,6 +29,67 @@ if TYPE_CHECKING:
     from ..event import AgentEvent
 else:
     AgentEvent = Any
+
+
+def _merge_base64_chunk_group(chunks: list[str]) -> str:
+    """Merge Base64 chunks with the toolkit compatibility fallback."""
+    try:
+        data = b"".join(
+            base64.b64decode(chunk, validate=True) for chunk in chunks
+        )
+        return base64.b64encode(data).decode("ascii")
+    except (binascii.Error, ValueError):
+        merged = chunks[0]
+        for chunk in chunks[1:]:
+            try:
+                data = base64.b64decode(
+                    merged,
+                    validate=True,
+                ) + base64.b64decode(chunk, validate=True)
+                merged = base64.b64encode(data).decode("ascii")
+            except (binascii.Error, ValueError):
+                merged += chunk
+        return merged
+
+
+def _merge_tool_result_data_blocks(
+    output: list[TextBlock | DataBlock],
+) -> list[TextBlock | DataBlock]:
+    """Merge same-ID Base64 tool-result chunks in one pass."""
+    merged_output: list[TextBlock | DataBlock] = []
+    groups: dict[str, tuple[DataBlock, list[str]]] = {}
+    for item in output:
+        if not isinstance(item, DataBlock) or not isinstance(
+            item.source,
+            Base64Source,
+        ):
+            merged_output.append(item)
+            continue
+
+        group = groups.get(item.id)
+        if group is None:
+            merged_output.append(item)
+            groups[item.id] = (item, [item.source.data])
+        else:
+            target, chunks = group
+            chunks.append(item.source.data)
+            target.name = item.name or target.name
+            target.source.media_type = item.source.media_type
+
+    for target, chunks in groups.values():
+        target.source.data = _merge_base64_chunk_group(chunks)
+
+    normalized_output: list[TextBlock | DataBlock] = []
+    for item in merged_output:
+        if (
+            isinstance(item, TextBlock)
+            and normalized_output
+            and isinstance(normalized_output[-1], TextBlock)
+        ):
+            normalized_output[-1].text += item.text
+        else:
+            normalized_output.append(item)
+    return normalized_output
 
 
 def _assert_user_content_blocks(content: Sequence[ContentBlock]) -> None:
@@ -454,6 +516,10 @@ class Msg(BaseModel):
                     )
                 else:
                     assert isinstance(block, ToolResultBlock)
+                    if isinstance(block.output, list):
+                        block.output = _merge_tool_result_data_blocks(
+                            block.output,
+                        )
                     block.state = event.state
                     block.metadata = event.metadata
                     block.finished_at = event.created_at

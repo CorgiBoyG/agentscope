@@ -23,7 +23,11 @@ from ._base import ToolBase
 from ._response import ToolResponse, ToolChunk
 from ..skill import SkillLoaderBase, Skill
 from ._types import RegisteredTool
-from .._utils._common import _describe_exception, _json_loads_with_repair
+from .._utils._common import (
+    _describe_exception,
+    _generate_id,
+    _json_loads_with_repair,
+)
 from ..exception import (
     DeveloperOrientedException,
     ToolNotFoundError,
@@ -61,6 +65,35 @@ Skills are a collection of instructions, scripts, and resources to extend your c
 </skill>{% endfor %}
 </agent-skills>
 """  # noqa: E501
+
+
+def _normalize_tool_chunk_block_ids(
+    tool_response: ToolResponse,
+    chunk: ToolChunk,
+) -> ToolChunk:
+    """Normalize data block IDs that conflict with existing text blocks.
+
+    ``ToolResponse.append_chunk`` assigns a new ID when a text block and a
+    data block share an ID. The streamed chunk must expose that same canonical
+    ID so event replay and the completed response cannot diverge.
+    """
+    block_types = {block.id: block.type for block in tool_response.content}
+    normalized_content = None
+
+    for index, block in enumerate(chunk.content):
+        existing_type = block_types.get(block.id)
+        if existing_type is None:
+            block_types[block.id] = block.type
+        elif existing_type == "text" and block.type == "data":
+            if normalized_content is None:
+                normalized_content = list(chunk.content)
+            normalized_block = block.model_copy(deep=True)
+            normalized_block.id = _generate_id()
+            normalized_content[index] = normalized_block
+
+    if normalized_content is None:
+        return chunk
+    return chunk.model_copy(update={"content": normalized_content})
 
 
 class Toolkit:
@@ -272,6 +305,10 @@ class Toolkit:
                     ],
                     state=ToolResultState.ERROR,
                 )
+                chunk = _normalize_tool_chunk_block_ids(
+                    tool_response,
+                    chunk,
+                )
                 yield chunk
                 yield tool_response.append_chunk(chunk)
                 return
@@ -285,6 +322,10 @@ class Toolkit:
                     ),
                 ],
                 state=ToolResultState.ERROR,
+            )
+            chunk = _normalize_tool_chunk_block_ids(
+                tool_response,
+                chunk,
             )
             yield chunk
             yield tool_response.append_chunk(chunk)
@@ -318,18 +359,27 @@ class Toolkit:
                 res = tool_func(**kwargs)
 
             if isinstance(res, ToolChunk):
+                res = _normalize_tool_chunk_block_ids(tool_response, res)
                 yield res
                 tool_response.append_chunk(res)
 
             # If return an async generator
             elif isinstance(res, AsyncGenerator):
                 async for chunk in res:
+                    chunk = _normalize_tool_chunk_block_ids(
+                        tool_response,
+                        chunk,
+                    )
                     yield chunk
                     tool_response.append_chunk(chunk)
 
             # If return a sync generator
             elif isinstance(res, Generator):
                 for chunk in res:
+                    chunk = _normalize_tool_chunk_block_ids(
+                        tool_response,
+                        chunk,
+                    )
                     yield chunk
                     tool_response.append_chunk(chunk)
 
@@ -350,6 +400,10 @@ class Toolkit:
                 ],
                 state=ToolResultState.ERROR,
             )
+            chunk = _normalize_tool_chunk_block_ids(
+                tool_response,
+                chunk,
+            )
             yield chunk
             tool_response.append_chunk(chunk)
 
@@ -368,6 +422,10 @@ class Toolkit:
                 ],
                 state=ToolResultState.ERROR,
             )
+            chunk = _normalize_tool_chunk_block_ids(
+                tool_response,
+                chunk,
+            )
             yield chunk
             tool_response.append_chunk(chunk)
 
@@ -383,6 +441,10 @@ class Toolkit:
                     ),
                 ],
                 state=ToolResultState.INTERRUPTED,
+            )
+            chunk = _normalize_tool_chunk_block_ids(
+                tool_response,
+                chunk,
             )
             yield chunk
             tool_response.append_chunk(chunk)

@@ -3,6 +3,7 @@
 """Regression tests for streaming data returned by tools."""
 import base64
 from types import SimpleNamespace
+from typing import Any, AsyncGenerator
 from unittest import IsolatedAsyncioTestCase
 
 from agentscope.agent import Agent
@@ -16,9 +17,68 @@ from agentscope.message import (
     AssistantMsg,
     Base64Source,
     DataBlock,
+    TextBlock,
+    ToolCallBlock,
     ToolResultState,
     URLSource,
 )
+from agentscope.permission import (
+    PermissionBehavior,
+    PermissionContext,
+    PermissionDecision,
+)
+from agentscope.state import AgentState
+from agentscope.tool import ToolBase, ToolChunk, Toolkit, ToolResponse
+
+
+class CrossTypeIdTool(ToolBase):
+    """Yield text and data blocks that intentionally share an ID."""
+
+    name: str = "cross_type_id"
+    description: str = "Exercise cross-type block ID normalization."
+    input_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {"data_first": {"type": "boolean"}},
+    }
+    is_concurrency_safe: bool = True
+    is_read_only: bool = True
+    is_external_tool: bool = False
+    is_mcp: bool = False
+
+    async def check_permissions(
+        self,
+        tool_input: dict[str, Any],
+        context: PermissionContext,
+    ) -> PermissionDecision:
+        """Allow the test tool call."""
+        return PermissionDecision(
+            behavior=PermissionBehavior.ALLOW,
+            decision_reason="Test tool always allows",
+            message="Test tool always allows",
+        )
+
+    async def __call__(
+        self,
+        data_first: bool = False,
+        **kwargs: Any,
+    ) -> AsyncGenerator[ToolChunk, None]:
+        """Yield blocks with a cross-type ID conflict."""
+        blocks = [
+            DataBlock(
+                id="same",
+                source=Base64Source(
+                    data=base64.b64encode(payload).decode("ascii"),
+                    media_type="application/octet-stream",
+                ),
+            )
+            for payload in (b"a", b"b")
+        ]
+        text = TextBlock(id="same", text="prefix")
+        sequence = (
+            [blocks[0], text, blocks[1]] if data_first else [text, *blocks]
+        )
+        for block in sequence:
+            yield ToolChunk(content=[block])
 
 
 class ToolDataStreamTest(IsolatedAsyncioTestCase):
@@ -85,6 +145,90 @@ class ToolDataStreamTest(IsolatedAsyncioTestCase):
                 "result_payloads": [b"helloworld"],
             },
         )
+
+    async def test_cross_type_id_conflicts_use_canonical_chunk_ids(
+        self,
+    ) -> None:
+        """Streamed events and the final response share data semantics."""
+        for data_first, expected_payloads in (
+            (False, [b"a", b"b"]),
+            (True, [b"ab"]),
+        ):
+            with self.subTest(data_first=data_first):
+                toolkit = Toolkit(tools=[CrossTypeIdTool()])
+                agent = SimpleNamespace(
+                    state=SimpleNamespace(reply_id="reply-1"),
+                )
+                reply = AssistantMsg(
+                    id="reply-1",
+                    name="agent",
+                    content=[],
+                )
+                reply.append_event(
+                    ToolResultStartEvent(
+                        reply_id="reply-1",
+                        tool_call_id="tool-1",
+                        tool_call_name="cross_type_id",
+                    ),
+                )
+                streamed_data_ids = []
+                response = None
+
+                async for result in toolkit.call_tool(
+                    ToolCallBlock(
+                        id="tool-1",
+                        name="cross_type_id",
+                        input=('{"data_first": true}' if data_first else "{}"),
+                    ),
+                    AgentState(),
+                ):
+                    if isinstance(result, ToolResponse):
+                        response = result
+                    else:
+                        async for event in Agent._convert_tool_chunk_to_event(
+                            agent,
+                            "tool-1",
+                            result.content,
+                        ):
+                            if isinstance(event, ToolResultDataDeltaEvent):
+                                streamed_data_ids.append(event.block_id)
+                            reply.append_event(event)
+
+                self.assertIsNotNone(response)
+                reply.append_event(
+                    ToolResultEndEvent(
+                        reply_id="reply-1",
+                        tool_call_id="tool-1",
+                        state=response.state,
+                    ),
+                )
+                replayed = list(reply.get_content_blocks("tool_result"))[0]
+                response_data = [
+                    block
+                    for block in response.content
+                    if isinstance(block, DataBlock)
+                ]
+                replayed_data = [
+                    block
+                    for block in replayed.output
+                    if isinstance(block, DataBlock)
+                ]
+
+                self.assertEqual(
+                    list(dict.fromkeys(streamed_data_ids)),
+                    [block.id for block in response_data],
+                )
+                self.assertEqual(
+                    [block.id for block in replayed_data],
+                    [block.id for block in response_data],
+                )
+                self.assertEqual(
+                    [
+                        base64.b64decode(block.source.data)
+                        for block in replayed_data
+                    ],
+                    expected_payloads,
+                )
 
     async def test_url_data_block_keeps_identity(self) -> None:
         """A one-shot URL result preserves the tool block identity."""
